@@ -36,123 +36,518 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from einops import rearrange
+from einops import rearrange, repeat
 
 from cosmos_predict2.conditioner import DataType
+from cosmos_predict2.models.text2image_dit import Attention, GPT2FeedForward, VideoSize
 from cosmos_predict2.models.video2world_dit import MinimalV1LVGDiT
 from imaginaire.utils.graph import create_cuda_graph
 
-
-class _MLP(nn.Module):
-    """Small MLP used for scalar action embedding."""
-
-    def __init__(self, in_features: int, out_features: int, hidden_mult: int = 4) -> None:
-        super().__init__()
-        hidden = out_features * hidden_mult
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(hidden, out_features),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+# ---------------------------------------------------------------------
+# Prophet uses Wan2.1 Video Autoencoder (Section 4.1.1)
+# (The tokenizer/autoencoder swap is wired in configs/tokenizers; here we keep
+# constants because Prophet modules assume Wan2.1 latent geometry.)
+# ---------------------------------------------------------------------
+WAN21_LATENT_CHANNELS = 16
+WAN21_SPATIAL_DOWNSAMPLE = 8  # 8x8
+WAN21_TEMPORAL_DOWNSAMPLE = 4  # 4x
 
 
-class ActionFrameRenderer(nn.Module):
+def _euler_xyz_to_matrix(euler_xyz: torch.Tensor) -> torch.Tensor:
     """
-    Differentiable "renderer" from 7D actions to small 2D action frames.
+    Convert XYZ euler angles to rotation matrices.
+    Args:
+        euler_xyz: (..., 3) in radians.
+    Returns:
+        R: (..., 3, 3)
+    """
+    if euler_xyz.shape[-1] != 3:
+        raise ValueError(f"Expected (...,3) euler, got {euler_xyz.shape}")
+    x, y, z = euler_xyz[..., 0], euler_xyz[..., 1], euler_xyz[..., 2]
+    cx, cy, cz = torch.cos(x), torch.cos(y), torch.cos(z)
+    sx, sy, sz = torch.sin(x), torch.sin(y), torch.sin(z)
 
-    Prophet describes projecting and rendering actions into 2D frames. The paper does not mandate a
-    specific renderer; here we implement a lightweight linear renderer:
+    # R = Rz * Ry * Rx
+    r00 = cz * cy
+    r01 = cz * sy * sx - sz * cx
+    r02 = cz * sy * cx + sz * sx
+    r10 = sz * cy
+    r11 = sz * sy * sx + cz * cx
+    r12 = sz * sy * cx - cz * sx
+    r20 = -sy
+    r21 = cy * sx
+    r22 = cy * cx
+    return torch.stack(
+        [
+            torch.stack([r00, r01, r02], dim=-1),
+            torch.stack([r10, r11, r12], dim=-1),
+            torch.stack([r20, r21, r22], dim=-1),
+        ],
+        dim=-2,
+    )
 
-        action[t] (7,) -> frame[t] (C, H, W)
-        frame[t] = sum_i action_i[t] * basis_i
 
-    where `basis_i` is learnable.
+def _point_line_distance_2d(
+    grid_xy_HW_2: torch.Tensor, p0_BT_2: torch.Tensor, p1_BT_2: torch.Tensor
+) -> torch.Tensor:
+    """
+    Compute per-pixel distance to 2D line segment p0->p1.
+    Args:
+        grid_xy_HW_2: (H,W,2)
+        p0_BT_2: (B,T,2)
+        p1_BT_2: (B,T,2)
+    Returns:
+        dist_B_T_H_W: (B,T,H,W)
+    """
+    # reshape to broadcast
+    g = grid_xy_HW_2[None, None, :, :, :]  # (1,1,H,W,2)
+    p0 = p0_BT_2[:, :, None, None, :]  # (B,T,1,1,2)
+    p1 = p1_BT_2[:, :, None, None, :]  # (B,T,1,1,2)
+    v = p1 - p0
+    w = g - p0
+    vv = (v * v).sum(dim=-1).clamp_min(1e-6)  # (B,T,1,1)
+    t = (w * v).sum(dim=-1) / vv  # (B,T,H,W)
+    t = t.clamp(0.0, 1.0)[..., None]  # (B,T,H,W,1)
+    proj = p0 + t * v  # (B,T,H,W,2)
+    d = g - proj
+    return torch.sqrt((d * d).sum(dim=-1) + 1e-6)
+
+
+class PhysicalActionFrameRenderer(nn.Module):
+    """
+    ProphRL ActionFrameRenderer (Section 3.2.2) — strict geometric renderer (no learnable basis).
+
+    Input:
+      - action: (B,T,7) with (dx,dy,dz, drx,dry,drz, gripper)
+      - K: (B,3,3) or (3,3)
+      - E: (B,4,4) or (4,4) where E maps world->camera
+
+    Output:
+      - frames: (B,3,T,H,W) in [0,1]
+
+    Notes:
+      The paper describes rendering around end-effector pose (p,R). In this codebase we only get
+      relative deltas; we therefore integrate deltas with a simple default initial pose:
+        p0 = (0,0,z_ref), R0 = I, and cumulative sum for translation + cumulative Euler for rotation.
+      This matches the required projection logic and is sufficient for wiring the module.
     """
 
-    def __init__(self, *, action_dim: int = 7, channels: int = 8, height: int = 16, width: int = 16) -> None:
+    axis_length: float = 0.15
+    r_ref: float = 40.0
+    z_ref: float = 1.0
+    r_min: float = 8.0
+    r_max: float = 140.0
+
+    def __init__(self, *, height: int = 256, width: int = 256, line_width: float = 2.0) -> None:
         super().__init__()
-        self.action_dim = action_dim
-        self.channels = channels
         self.height = height
         self.width = width
-        self.basis = nn.Parameter(torch.zeros(action_dim, channels, height, width))
-        self.reset_parameters()
+        self.line_width = line_width
 
-    def reset_parameters(self) -> None:
-        nn.init.trunc_normal_(self.basis, std=0.02)
+        # Precompute pixel grid (H,W,2) in (x,y) order.
+        ys = torch.arange(height, dtype=torch.float32)
+        xs = torch.arange(width, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        grid = torch.stack([grid_x, grid_y], dim=-1)  # (H,W,2)
+        self.register_buffer("grid_xy_HW_2", grid, persistent=False)
 
-    def forward(self, action_B_T_D: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _gripper_colormap(gripper_BT_1: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            action_B_T_D: (B, T, 7) or (B, T, D) where D==action_dim
-        Returns:
-            frames_B_C_T_H_W: (B, C, T, H, W)
+        Fixed colormap for gripper signal.
+        Map scalar in [0,1] -> RGB.
         """
-        if action_B_T_D.ndim != 3:
-            raise ValueError(f"Expected action of shape (B,T,D), got {action_B_T_D.shape}")
-        if action_B_T_D.shape[-1] != self.action_dim:
-            raise ValueError(
-                f"Expected action last dim={self.action_dim}, got {action_B_T_D.shape[-1]} (shape={action_B_T_D.shape})"
-            )
-        # (B, T, D) x (D, C, H, W) -> (B, T, C, H, W)
-        frames_B_T_C_H_W = torch.einsum("btd,dchw->btchw", action_B_T_D, self.basis)
-        return frames_B_T_C_H_W.permute(0, 2, 1, 3, 4).contiguous()
+        g = gripper_BT_1.clamp(0.0, 1.0)
+        # 4-point gradient: blue -> cyan -> yellow -> red
+        c0 = torch.tensor([0.0, 0.2, 1.0], device=g.device, dtype=g.dtype)
+        c1 = torch.tensor([0.0, 0.9, 1.0], device=g.device, dtype=g.dtype)
+        c2 = torch.tensor([1.0, 0.9, 0.0], device=g.device, dtype=g.dtype)
+        c3 = torch.tensor([1.0, 0.1, 0.0], device=g.device, dtype=g.dtype)
+        t = g
+        # piecewise linear interpolation
+        t0 = (t * 3.0).clamp(0.0, 3.0)
+        w0 = (1.0 - (t0 - 0.0).clamp(0.0, 1.0)).unsqueeze(-1)
+        w1 = ((t0 - 0.0).clamp(0.0, 1.0)).unsqueeze(-1)
+        w2 = ((t0 - 1.0).clamp(0.0, 1.0)).unsqueeze(-1)
+        w3 = ((t0 - 2.0).clamp(0.0, 1.0)).unsqueeze(-1)
+
+        col01 = c0 * w0 + c1 * w1
+        col12 = c1 * (1.0 - w2) + c2 * w2
+        col23 = c2 * (1.0 - w3) + c3 * w3
+
+        # select segments
+        seg0 = (t0 < 1.0).to(dtype=g.dtype).unsqueeze(-1)
+        seg1 = ((t0 >= 1.0) & (t0 < 2.0)).to(dtype=g.dtype).unsqueeze(-1)
+        seg2 = (t0 >= 2.0).to(dtype=g.dtype).unsqueeze(-1)
+        return col01 * seg0 + col12 * seg1 + col23 * seg2  # (B,T,1,3)
+
+    def forward(self, action_B_T_7: torch.Tensor, K: torch.Tensor, E: torch.Tensor) -> torch.Tensor:
+        if action_B_T_7.ndim != 3 or action_B_T_7.shape[-1] != 7:
+            raise ValueError(f"Expected action (B,T,7), got {action_B_T_7.shape}")
+        device = action_B_T_7.device
+        dtype = torch.float32  # use float32 for raster math stability
+        B, T, _ = action_B_T_7.shape
+
+        # K, E broadcast to batch if unbatched
+        if K.ndim == 2:
+            K = K[None, :, :].expand(B, -1, -1)
+        if E.ndim == 2:
+            E = E[None, :, :].expand(B, -1, -1)
+        if K.shape != (B, 3, 3):
+            raise ValueError(f"Expected K shape (B,3,3), got {K.shape}")
+        if E.shape != (B, 4, 4):
+            raise ValueError(f"Expected E shape (B,4,4), got {E.shape}")
+
+        a = action_B_T_7.to(dtype=dtype)
+        dxyz = a[:, :, 0:3]
+        deuler = a[:, :, 3:6]
+        gripper = a[:, :, 6:7]
+
+        # integrate pose (simple default initial pose)
+        p0 = torch.tensor([0.0, 0.0, self.z_ref], device=device, dtype=dtype)[None, None, :]  # (1,1,3)
+        p = p0 + torch.cumsum(dxyz, dim=1)  # (B,T,3)
+        euler = torch.cumsum(deuler, dim=1)  # (B,T,3)
+        R = _euler_xyz_to_matrix(euler)  # (B,T,3,3)
+
+        # axis endpoints: p + R * (axis_length * e_k)
+        axis = torch.eye(3, device=device, dtype=dtype) * self.axis_length  # (3,3)
+        # (B,T,3,3) @ (3,3) -> (B,T,3,3) where last dim is xyz, axis index in dim=2
+        axis_vecs = torch.einsum("btij,kj->btki", R, axis)  # (B,T,3,3)
+        pk = p[:, :, None, :] + axis_vecs  # (B,T,3,3)
+
+        def project(points_B_T_N_3: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # points -> cam space
+            ones = torch.ones((*points_B_T_N_3.shape[:-1], 1), device=device, dtype=dtype)
+            ph = torch.cat([points_B_T_N_3, ones], dim=-1)  # (B,T,N,4)
+            x_cam = torch.einsum("bij,btnj->btni", E.to(dtype=dtype), ph)  # (B,T,N,4)
+            x = x_cam[..., 0:3]  # (B,T,N,3)
+            z = x[..., 2:3].clamp_min(1e-6)
+            u_h = torch.einsum("bij,btnj->btni", K.to(dtype=dtype), x)  # (B,T,N,3)
+            u = u_h[..., 0:2] / z  # (B,T,N,2)
+            return u, z.squeeze(-1)  # u (B,T,N,2), z (B,T,N)
+
+        u_center, z_center = project(p[:, :, None, :])  # N=1
+        u_axes, _ = project(pk)  # N=3
+        u0 = u_center[:, :, 0, :]  # (B,T,2)
+        u_xyz = u_axes  # (B,T,3,2)
+
+        # radius based on depth (use center depth)
+        r = (self.r_ref * (self.z_ref / z_center)).clamp(self.r_min, self.r_max)  # (B,T)
+
+        # base colors
+        axis_colors = torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.2, 1.0]], device=device, dtype=dtype
+        )  # x,y,z
+        grip_color = self._gripper_colormap(((gripper + 1.0) / 2.0).to(dtype=dtype))  # (B,T,1,3)
+
+        grid = self.grid_xy_HW_2.to(device=device, dtype=dtype)  # (H,W,2)
+        # distance to center for disk
+        dxy = grid[None, None, :, :, :] - u0[:, :, None, None, :]  # (B,T,H,W,2)
+        dist_center = torch.sqrt((dxy * dxy).sum(dim=-1) + 1e-6)  # (B,T,H,W)
+        disk = (dist_center <= r[:, :, None, None]).to(dtype=dtype)  # (B,T,H,W)
+
+        # draw axis lines: distance to segment threshold
+        # For each axis k, segment u0 -> u_xyz[:,:,k]
+        frames = torch.zeros((B, T, 3, self.height, self.width), device=device, dtype=dtype)
+
+        # disk: fill with gripper color
+        frames = frames + (disk[:, :, None, :, :] * grip_color[:, :, 0, :, None, None]).permute(0, 1, 2, 3, 4)
+
+        # axis lines
+        for k in range(3):
+            p1 = u_xyz[:, :, k, :]  # (B,T,2)
+            dist_line = _point_line_distance_2d(grid, u0, p1)  # (B,T,H,W)
+            line_mask = (dist_line <= self.line_width).to(dtype=dtype)
+            col = axis_colors[k][None, None, :, None, None]  # (1,1,3,1,1)
+            frames = torch.maximum(frames, line_mask[:, :, None, :, :] * col)
+
+        # clamp and permute to (B,3,T,H,W)
+        frames = frames.clamp(0.0, 1.0)
+        return frames.permute(0, 2, 1, 3, 4).contiguous()
 
 
-class ActionFrameEncoder(nn.Module):
-    """3D conv + pooling to turn rendered action frames into a global embedding."""
+class ScalarActionMLP(nn.Module):
+    """Scalar stream: action chunk (B,T,7) -> (B,1,Dm)."""
 
-    def __init__(
-        self,
-        *,
-        in_channels: int,
-        out_dim: int,
-        hidden_channels: int = 128,
-    ) -> None:
+    def __init__(self, *, action_dim: int, action_horizon: int, d_model: int = 1024) -> None:
         super().__init__()
+        self.action_dim = action_dim
+        self.action_horizon = action_horizon
+        self.d_model = d_model
+        in_dim = action_dim * action_horizon
         self.net = nn.Sequential(
-            nn.Conv3d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.Linear(in_dim, d_model * 4, bias=True),
             nn.GELU(approximate="tanh"),
-            nn.Conv3d(hidden_channels, out_dim, kernel_size=1, bias=False),
+            nn.Linear(d_model * 4, d_model, bias=True),
+        )
+
+    def forward(self, action_B_T_7: torch.Tensor) -> torch.Tensor:
+        if action_B_T_7.ndim != 3 or action_B_T_7.shape[-1] != self.action_dim:
+            raise ValueError(f"Expected action (B,T,{self.action_dim}), got {action_B_T_7.shape}")
+        if action_B_T_7.shape[1] != self.action_horizon:
+            raise ValueError(
+                f"Expected action horizon {self.action_horizon}, got {action_B_T_7.shape[1]} (shape={action_B_T_7.shape})"
+            )
+        x = rearrange(action_B_T_7, "b t d -> b (t d)")
+        return self.net(x).unsqueeze(1)  # (B,1,Dm)
+
+
+class ActionFrameLatentEncoder(nn.Module):
+    """
+    Action Frame Stream (Section 3.2.3): consumes Wan2.1 VAE latents of rendered action frames.
+
+    Expected input: (B, C_l=16, T_l, H_l, W_l)
+    Conv group: 1x1x1 -> 1x3x3 -> 1x1x1, then global avg pool to (B,Dm).
+    """
+
+    def __init__(self, *, in_channels: int = WAN21_LATENT_CHANNELS, d_model: int = 1024) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.d_model = d_model
+        mid = d_model // 2
+        self.net = nn.Sequential(
+            nn.Conv3d(in_channels, mid, kernel_size=(1, 1, 1), padding=0, bias=False),
+            nn.GELU(approximate="tanh"),
+            nn.Conv3d(mid, mid, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.GELU(approximate="tanh"),
+            nn.Conv3d(mid, d_model, kernel_size=(1, 1, 1), padding=0, bias=False),
             nn.AdaptiveAvgPool3d((1, 1, 1)),
         )
 
-    def forward(self, frames_B_C_T_H_W: torch.Tensor) -> torch.Tensor:
-        x = self.net(frames_B_C_T_H_W)
-        return x.flatten(1)  # (B, out_dim)
+    def forward(self, action_latents_B_C_T_H_W: torch.Tensor) -> torch.Tensor:
+        if action_latents_B_C_T_H_W.ndim != 5:
+            raise ValueError(f"Expected action latents (B,C,T,H,W), got {action_latents_B_C_T_H_W.shape}")
+        if action_latents_B_C_T_H_W.shape[1] != self.in_channels:
+            raise ValueError(
+                f"Expected action latents channels {self.in_channels}, got {action_latents_B_C_T_H_W.shape[1]}"
+            )
+        x = self.net(action_latents_B_C_T_H_W)
+        return x.flatten(1).unsqueeze(1)  # (B,1,Dm)
 
 
-class HistoryEncoder(nn.Module):
+class FramePack(nn.Module):
     """
-    History-aware external memory encoder.
+    FramePack (Section 3.2.4): history latents -> pooled memory matrix M.
 
-    Turns latent history (B, C, T_h, H, W) into cross-attention tokens (B, M, D_ctx) using:
-      3D avg pool -> flatten spatiotemporal positions -> linear projection.
+    Input: history_latents (B, C_l, T_h, H_l, W_l)
+    Output: M (B, S_mem, D_ctx) where D_ctx == cross-attn context dim.
     """
 
     def __init__(
         self,
         *,
-        latent_channels: int,
+        latent_channels: int = WAN21_LATENT_CHANNELS,
         context_dim: int,
-        pool_kernel: tuple[int, int, int] = (3, 4, 4),
+        pool_kernel: tuple[int, int, int] = (3, 2, 2),
         pool_stride: tuple[int, int, int] | None = None,
     ) -> None:
         super().__init__()
-        self.pool_kernel = pool_kernel
-        self.pool_stride = pool_stride if pool_stride is not None else pool_kernel
-        self.pool = nn.AvgPool3d(kernel_size=self.pool_kernel, stride=self.pool_stride, ceil_mode=False)
+        stride = pool_stride if pool_stride is not None else pool_kernel
+        self.pool = nn.AvgPool3d(kernel_size=pool_kernel, stride=stride, ceil_mode=False)
         self.proj = nn.Linear(latent_channels, context_dim, bias=False)
 
     def forward(self, history_latents_B_C_T_H_W: torch.Tensor) -> torch.Tensor:
         if history_latents_B_C_T_H_W.ndim != 5:
             raise ValueError(f"Expected history latents (B,C,T,H,W), got {history_latents_B_C_T_H_W.shape}")
-        pooled = self.pool(history_latents_B_C_T_H_W)  # (B, C, T', H', W')
+        pooled = self.pool(history_latents_B_C_T_H_W)
         tokens = rearrange(pooled, "b c t h w -> b (t h w) c").contiguous()
-        return self.proj(tokens)  # (B, M, D_ctx)
+        return self.proj(tokens)
+
+
+class ProphetCrossAttention(nn.Module):
+    """
+    Cross-attention with explicit memory KV concatenation:
+      new_K = cat([K_mem, K], dim=seq_len)
+      new_V = cat([V_mem, V], dim=seq_len)
+    """
+
+    def __init__(self, base: Attention) -> None:
+        super().__init__()
+        self.base = base
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor, memory: torch.Tensor | None = None) -> torch.Tensor:
+        # Build Q from x
+        q = self.base.q_proj(x)
+        q = rearrange(q, "b s (h d) -> b s h d", h=self.base.n_heads, d=self.base.head_dim)
+        q = self.base.q_norm(q)
+
+        # Build K/V from context
+        k = self.base.k_proj(context)
+        v = self.base.v_proj(context)
+        k = rearrange(k, "b s (h d) -> b s h d", h=self.base.n_heads, d=self.base.head_dim)
+        v = rearrange(v, "b s (h d) -> b s h d", h=self.base.n_heads, d=self.base.head_dim)
+        k = self.base.k_norm(k)
+        v = self.base.v_norm(v)
+
+        if memory is not None:
+            km = self.base.k_proj(memory)
+            vm = self.base.v_proj(memory)
+            km = rearrange(km, "b s (h d) -> b s h d", h=self.base.n_heads, d=self.base.head_dim)
+            vm = rearrange(vm, "b s (h d) -> b s h d", h=self.base.n_heads, d=self.base.head_dim)
+            km = self.base.k_norm(km)
+            vm = self.base.v_norm(vm)
+            k = torch.cat([km, k], dim=1)
+            v = torch.cat([vm, v], dim=1)
+
+        # Compute attention (no RoPE for cross-attn)
+        out = self.base.attn_op(q, k, v)
+        return self.base.output_dropout(self.base.output_proj(out))
+
+
+class ProphetBlock(nn.Module):
+    """
+    DiT block with explicit KV concat for memory in cross-attention.
+    This is a Prophet-specific variant of `cosmos_predict2.models.text2image_dit.Block`.
+    """
+
+    def __init__(
+        self,
+        *,
+        x_dim: int,
+        context_dim: int,
+        num_heads: int,
+        mlp_ratio: float,
+        self_attention_backend: str,
+        cross_attention_backend: str,
+        natten_params: Any = None,
+        use_adaln_lora: bool = False,
+        adaln_lora_dim: int = 256,
+    ) -> None:
+        super().__init__()
+        self.x_dim = x_dim
+        self.layer_norm_self_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
+        self.self_attn = Attention(
+            x_dim,
+            None,
+            num_heads,
+            x_dim // num_heads,
+            qkv_format="bshd",
+            backend=self_attention_backend,
+            natten_params=natten_params,
+        )
+        self.layer_norm_cross_attn = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
+        base_cross = Attention(
+            x_dim,
+            context_dim,
+            num_heads,
+            x_dim // num_heads,
+            qkv_format="bshd",
+            backend=cross_attention_backend,
+        )
+        self.cross_attn = ProphetCrossAttention(base_cross)
+        self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
+
+        # Keep AdaLN-LoRA flags for compatibility with existing configs.
+        self.use_adaln_lora = use_adaln_lora
+        if self.use_adaln_lora:
+            self.adaln_modulation_self_attn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(x_dim, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+            )
+            self.adaln_modulation_cross_attn = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(x_dim, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+            )
+            self.adaln_modulation_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(x_dim, adaln_lora_dim, bias=False),
+                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+            )
+        else:
+            self.adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+            self.adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+            self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+
+        self.cp_size = None
+
+    def set_context_parallel_group(self, process_group, ranks, stream) -> None:  # parity with base Block API
+        self.cp_size = None if ranks is None else len(ranks)
+        self.self_attn.set_context_parallel_group(process_group=process_group, ranks=ranks, stream=stream)
+
+    def forward(
+        self,
+        x_B_T_H_W_D: torch.Tensor,
+        emb_B_T_D: torch.Tensor,
+        crossattn_emb: torch.Tensor,
+        memory_M_B_S_D: torch.Tensor | None = None,
+        rope_emb_L_1_1_D: torch.Tensor | None = None,
+        adaln_lora_B_T_3D: torch.Tensor | None = None,
+        extra_per_block_pos_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if extra_per_block_pos_emb is not None:
+            x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
+
+        if self.use_adaln_lora:
+            assert adaln_lora_B_T_3D is not None
+            shift_sa, scale_sa, gate_sa = (self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D).chunk(
+                3, dim=-1
+            )
+            shift_ca, scale_ca, gate_ca = (self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D).chunk(
+                3, dim=-1
+            )
+            shift_mlp, scale_mlp, gate_mlp = (self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D).chunk(
+                3, dim=-1
+            )
+        else:
+            shift_sa, scale_sa, gate_sa = self.adaln_modulation_self_attn(emb_B_T_D).chunk(3, dim=-1)
+            shift_ca, scale_ca, gate_ca = self.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
+            shift_mlp, scale_mlp, gate_mlp = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+
+        # (B,T,D) -> (B,T,1,1,D)
+        def bt1(ten: torch.Tensor) -> torch.Tensor:
+            return rearrange(ten, "b t d -> b t 1 1 d")
+
+        shift_sa, scale_sa, gate_sa = bt1(shift_sa), bt1(scale_sa), bt1(gate_sa)
+        shift_ca, scale_ca, gate_ca = bt1(shift_ca), bt1(scale_ca), bt1(gate_ca)
+        shift_mlp, scale_mlp, gate_mlp = bt1(shift_mlp), bt1(scale_mlp), bt1(gate_mlp)
+
+        B, T, H, W, D = x_B_T_H_W_D.shape
+
+        def modulate(x: torch.Tensor, ln: nn.Module, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+            return ln(x) * (1 + scale) + shift
+
+        # self-attn
+        norm_x = modulate(x_B_T_H_W_D, self.layer_norm_self_attn, scale_sa, shift_sa)
+        video_size = VideoSize(T=T, H=H, W=W)
+        if self.cp_size is not None and self.cp_size > 1:
+            video_size = VideoSize(T=T * self.cp_size, H=H, W=W)
+        sa_out = rearrange(
+            self.self_attn(
+                rearrange(norm_x, "b t h w d -> b (t h w) d"),
+                None,
+                rope_emb=rope_emb_L_1_1_D,
+                video_size=video_size,
+            ),
+            "b (t h w) d -> b t h w d",
+            t=T,
+            h=H,
+            w=W,
+        )
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_sa * sa_out
+
+        # cross-attn with explicit memory KV concat
+        norm_x = modulate(x_B_T_H_W_D, self.layer_norm_cross_attn, scale_ca, shift_ca)
+        ca_out = rearrange(
+            self.cross_attn(
+                rearrange(norm_x, "b t h w d -> b (t h w) d"),
+                crossattn_emb,
+                memory=memory_M_B_S_D,
+            ),
+            "b (t h w) d -> b t h w d",
+            t=T,
+            h=H,
+            w=W,
+        )
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_ca * ca_out
+
+        # mlp
+        norm_x = modulate(x_B_T_H_W_D, self.layer_norm_mlp, scale_mlp, shift_mlp)
+        mlp_out = self.mlp(norm_x)
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp * mlp_out
+        return x_B_T_H_W_D
 
 
 @dataclass
@@ -163,79 +558,74 @@ class ProphetHistoryBufferConfig:
 
 class ProphetMinimalV1LVGDiT(MinimalV1LVGDiT):
     """
-    Prophet-augmented DiT for Video2World.
+    Prophet-augmented DiT for Video2World (ProphRL Section 3.2.3 & 3.2.4).
 
-    This is designed as a drop-in replacement for `MinimalV1LVGDiT`, with extra optional kwargs:
-    - `action`: (B, T_a, 7) action chunk.
-    - `history_latents`: (B, C, T_h, H, W) latent history frames for external memory.
+    Hard changes vs Cosmos:
+    - Dual Action Conditioning: scalar MLP + action-frame latent encoder, both injected into timestep embeddings.
+    - History-aware memory: FramePack -> memory M, and each block cross-attn explicitly concatenates K/V with memory K/V.
     """
 
     def __init__(
         self,
         *args: Any,
-        action_chunk_dim: int | None = None,
-        action_dim: int = 7,
-        action_frame_channels: int = 8,
-        action_frame_size: tuple[int, int] = (16, 16),
-        use_action_frame_stream: bool = True,
-        use_scalar_action_stream: bool = True,
-        inject_action_into_adaln_lora: bool = False,
+        action_horizon: int = 12,
+        d_model: int = 1024,
         history: ProphetHistoryBufferConfig | None = None,
-        history_pool_kernel: tuple[int, int, int] = (3, 4, 4),
+        history_pool_kernel: tuple[int, int, int] = (3, 2, 2),
         history_pool_stride: tuple[int, int, int] | None = None,
         **kwargs: Any,
     ) -> None:
-        # `MinimalV1LVGDiT` already increments in_channels for condition mask.
         super().__init__(*args, **kwargs)
 
-        self.use_scalar_action_stream = use_scalar_action_stream
-        self.use_action_frame_stream = use_action_frame_stream
-        self.inject_action_into_adaln_lora = inject_action_into_adaln_lora
+        # Enforce Prophet hidden size expectation (Dm=1024) unless caller deliberately changes it.
+        if self.model_channels != d_model:
+            raise ValueError(f"Prophet requires model_channels (Dm) == {d_model}, got {self.model_channels}")
 
-        self._action_dim = action_dim
-        self._action_chunk_dim = action_chunk_dim  # if None, infer at runtime from input action shape
+        self.d_model = d_model
+        self.action_horizon = action_horizon
+        self.scalar_action = ScalarActionMLP(action_dim=7, action_horizon=action_horizon, d_model=d_model)
+        self.action_frame_latent = ActionFrameLatentEncoder(in_channels=WAN21_LATENT_CHANNELS, d_model=d_model)
+        self.action_renderer = PhysicalActionFrameRenderer()
 
-        # Cross-attn context dimension (after optional `crossattn_proj`).
-        self.crossattn_context_dim = self.blocks[0].cross_attn.context_dim  # type: ignore[attr-defined]
-
-        # -------------------------
-        # Dual Action Conditioning
-        # -------------------------
-        # Scalar stream: action chunk -> global embedding.
-        if self.use_scalar_action_stream:
-            # The action chunk is typically (B, T_a, 7). We flatten to (B, T_a*7).
-            # If action_chunk_dim is not provided, we lazily instantiate the MLP on first forward.
-            self.scalar_action_mlp: nn.Module | None = None
-        else:
-            self.scalar_action_mlp = None
-
-        # Action-frame stream: 7D -> frames -> 3D conv -> embedding.
-        if self.use_action_frame_stream:
-            h, w = action_frame_size
-            self.action_frame_renderer = ActionFrameRenderer(
-                action_dim=action_dim, channels=action_frame_channels, height=h, width=w
-            )
-            self.action_frame_encoder = ActionFrameEncoder(
-                in_channels=action_frame_channels, out_dim=self.model_channels
-            )
-        else:
-            self.action_frame_renderer = None
-            self.action_frame_encoder = None
-
-        # -------------------------
-        # History-aware Mechanism
-        # -------------------------
-        self.history_cfg = history if history is not None else ProphetHistoryBufferConfig(enabled=False)
+        self.history_cfg = history if history is not None else ProphetHistoryBufferConfig(enabled=True)
         self._history_latents: torch.Tensor | None = None
-        self.history_encoder = HistoryEncoder(
-            latent_channels=self.in_channels,  # NOTE: expects latent channels BEFORE adding mask channel
-            context_dim=self.crossattn_context_dim,
+
+        # Determine context dim for cross-attn. If there is a projection, it sets to crossattn_emb_channels.
+        context_dim = self.blocks[0].cross_attn.context_dim  # type: ignore[attr-defined]
+        self.framepack = FramePack(
+            latent_channels=WAN21_LATENT_CHANNELS,
+            context_dim=context_dim,
             pool_kernel=history_pool_kernel,
             pool_stride=history_pool_stride,
         )
 
+        # Replace blocks with ProphetBlocks (to implement explicit KV concat).
+        # NOTE: this is a structural change and is not checkpoint-compatible with Cosmos weights.
+        new_blocks = nn.ModuleList()
+        for i, old_block in enumerate(self.blocks):
+            # Best-effort: preserve backend choices by looking at underlying Attention backend strings.
+            # Self-attn backend is stored as `backend` on Attention.
+            sa_backend = getattr(old_block.self_attn, "backend", "transformer_engine")
+            ca_backend = getattr(old_block.cross_attn, "backend", "transformer_engine")
+            natten_params = getattr(old_block.self_attn, "natten_params", None) if sa_backend == "natten" else None
+
+            new_blocks.append(
+                ProphetBlock(
+                    x_dim=self.model_channels,
+                    context_dim=context_dim,
+                    num_heads=self.num_heads,
+                    mlp_ratio=getattr(old_block, "mlp_ratio", 4.0),
+                    self_attention_backend=sa_backend,
+                    cross_attention_backend=ca_backend,
+                    natten_params=natten_params,
+                    use_adaln_lora=self.use_adaln_lora,
+                    adaln_lora_dim=self.adaln_lora_dim,
+                )
+            )
+        self.blocks = new_blocks
+
     # ---------------------------------------------------------------------
-    # History buffer helpers (used by closed-loop rollouts; optional in fwd)
+    # History buffer helpers (for closed-loop training; optional in forward)
     # ---------------------------------------------------------------------
     def reset_history(self) -> None:
         self._history_latents = None
@@ -246,67 +636,13 @@ class ProphetMinimalV1LVGDiT(MinimalV1LVGDiT):
             return
         if new_latents_B_C_T_H_W.ndim != 5:
             raise ValueError(f"Expected new latents (B,C,T,H,W), got {new_latents_B_C_T_H_W.shape}")
-
         if self._history_latents is None:
             self._history_latents = new_latents_B_C_T_H_W.detach()
         else:
-            # If batch/shape mismatch, reset history (closed-loop runner should keep shapes consistent).
-            if (
-                self._history_latents.shape[0] != new_latents_B_C_T_H_W.shape[0]
-                or self._history_latents.shape[1] != new_latents_B_C_T_H_W.shape[1]
-                or self._history_latents.shape[3:] != new_latents_B_C_T_H_W.shape[3:]
-            ):
-                self._history_latents = new_latents_B_C_T_H_W.detach()
-            else:
-                self._history_latents = torch.cat([self._history_latents, new_latents_B_C_T_H_W.detach()], dim=2)
-
-        # Keep last T_h frames.
+            self._history_latents = torch.cat([self._history_latents, new_latents_B_C_T_H_W.detach()], dim=2)
         if self._history_latents.shape[2] > self.history_cfg.history_size:
             self._history_latents = self._history_latents[:, :, -self.history_cfg.history_size :, :, :].contiguous()
 
-    def _build_scalar_action_mlp_if_needed(self, action_B_T_D: torch.Tensor) -> None:
-        if self.scalar_action_mlp is not None:
-            return
-        if self._action_chunk_dim is not None:
-            in_dim = self._action_chunk_dim
-        else:
-            if action_B_T_D.ndim != 3:
-                raise ValueError(f"Expected action shape (B,T,D), got {action_B_T_D.shape}")
-            in_dim = action_B_T_D.shape[1] * action_B_T_D.shape[2]
-        self.scalar_action_mlp = _MLP(in_dim, self.model_channels)
-
-    def _compute_action_embedding(self, action_B_T_D: torch.Tensor) -> torch.Tensor:
-        """
-        Returns a global action embedding shaped (B, 1, D_model) to be broadcast across video timesteps.
-        """
-        if action_B_T_D.ndim != 3:
-            raise ValueError(f"Expected action shape (B,T,D), got {action_B_T_D.shape}")
-        B = action_B_T_D.shape[0]
-        flat = rearrange(action_B_T_D, "b t d -> b (t d)")
-
-        emb_parts: list[torch.Tensor] = []
-
-        if self.use_scalar_action_stream:
-            self._build_scalar_action_mlp_if_needed(action_B_T_D)
-            assert self.scalar_action_mlp is not None
-            emb_parts.append(self.scalar_action_mlp(flat))  # (B, D_model)
-
-        if self.use_action_frame_stream:
-            assert self.action_frame_renderer is not None
-            assert self.action_frame_encoder is not None
-            frames = self.action_frame_renderer(action_B_T_D.to(dtype=self.action_frame_renderer.basis.dtype))
-            emb_parts.append(self.action_frame_encoder(frames))  # (B, D_model)
-
-        if not emb_parts:
-            return torch.zeros((B, 1, self.model_channels), device=action_B_T_D.device, dtype=action_B_T_D.dtype)
-
-        emb = torch.stack(emb_parts, dim=0).sum(dim=0)  # (B, D_model)
-        return emb.unsqueeze(1)  # (B, 1, D_model)
-
-    def _compute_history_tokens(self, history_latents_B_C_T_H_W: torch.Tensor) -> torch.Tensor:
-        return self.history_encoder(history_latents_B_C_T_H_W.to(dtype=self.history_encoder.proj.weight.dtype))
-
-    # ----------------------------- forward -----------------------------
     def forward(
         self,
         x_B_C_T_H_W: torch.Tensor,
@@ -318,14 +654,19 @@ class ProphetMinimalV1LVGDiT(MinimalV1LVGDiT):
         data_type: DataType | None = DataType.VIDEO,
         use_cuda_graphs: bool = False,
         *,
-        action: torch.Tensor | None = None,
-        history_latents: torch.Tensor | None = None,
+        # Dual Action Conditioning inputs:
+        action: torch.Tensor | None = None,  # (B, Ta, 7)
+        action_frame_latents: torch.Tensor | None = None,  # (B, 16, Ta/4, H/8, W/8) from Wan2.1 VAE
+        # Renderer inputs (to produce action frames externally; this class does not run Wan2.1 encode here):
+        K: torch.Tensor | None = None,  # (B,3,3) or (3,3)
+        E: torch.Tensor | None = None,  # (B,4,4) or (4,4)
+        # History:
+        history_latents: torch.Tensor | None = None,  # (B, 16, Th, H/8, W/8)
         **kwargs: Any,
     ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, list[torch.Tensor]]:
-        # Keep compatibility with other callers that may pass extra keys.
         del kwargs
 
-        # --- same mask-channel behavior as MinimalV1LVGDiT ---
+        # Keep original condition-mask behavior.
         if data_type == DataType.VIDEO:
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, condition_video_input_mask_B_C_T_H_W.type_as(x_B_C_T_H_W)], dim=1
@@ -343,47 +684,50 @@ class ProphetMinimalV1LVGDiT(MinimalV1LVGDiT):
         assert isinstance(data_type, DataType), f"Expected DataType, got {type(data_type)}."
         assert not (self.training and use_cuda_graphs), "CUDA Graphs are supported only for inference"
 
-        # --- patch+pos embed ---
-        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D = self.prepare_embedded_sequence(
-            x_B_C_T_H_W,
-            fps=fps,
-            padding_mask=padding_mask,
+        x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = self.prepare_embedded_sequence(
+            x_B_C_T_H_W, fps=fps, padding_mask=padding_mask
         )
 
-        # --- cross-attn context projection (text) ---
         if self.crossattn_proj is not None:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
 
-        # --- history external memory: concat to cross-attn context ---
-        hist_src = history_latents
-        if hist_src is None and self.history_cfg.enabled:
-            hist_src = self._history_latents
-        if hist_src is not None:
-            history_tokens = self._compute_history_tokens(hist_src).to(device=crossattn_emb.device, dtype=crossattn_emb.dtype)
-            crossattn_emb = torch.cat([crossattn_emb, history_tokens], dim=1)
-
-        # --- timestep embedding ---
+        # timestep embedding
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
         t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
 
-        # --- dual action conditioning: inject into timestep embedding ---
+        # -------------------- Dual Action Conditioning --------------------
         if action is not None:
-            if action.ndim != 3:
-                raise ValueError(f"Expected action (B,T,7), got {action.shape}")
-            if action.shape[-1] != self._action_dim:
-                raise ValueError(f"Expected action last dim={self._action_dim}, got {action.shape[-1]} (shape={action.shape})")
-            action_emb_B_1_D = self._compute_action_embedding(action).to(device=t_embedding_B_T_D.device, dtype=t_embedding_B_T_D.dtype)
-            t_embedding_B_T_D = t_embedding_B_T_D + action_emb_B_1_D
-            if self.inject_action_into_adaln_lora and adaln_lora_B_T_3D is not None:
-                # Project the same action embedding to 3*D for AdaLN-LoRA modulation.
-                # This is optional; Prophet only requires timestep injection.
-                proj_3d = torch.cat([action_emb_B_1_D, action_emb_B_1_D, action_emb_B_1_D], dim=-1)
-                adaln_lora_B_T_3D = adaln_lora_B_T_3D + proj_3d
+            # scalar stream
+            a_scalar = self.scalar_action(action.to(dtype=t_embedding_B_T_D.dtype, device=t_embedding_B_T_D.device))
+            # broadcast from (B,1,D) to (B,T,D)
+            a_scalar = repeat(a_scalar, "b 1 d -> b t d", t=t_embedding_B_T_D.shape[1])
+            t_embedding_B_T_D = t_embedding_B_T_D + a_scalar
+
+            # action-frame stream (expects Wan2.1 VAE latents, not pixels)
+            if action_frame_latents is not None:
+                a_frame = self.action_frame_latent(
+                    action_frame_latents.to(dtype=t_embedding_B_T_D.dtype, device=t_embedding_B_T_D.device)
+                )  # (B,1,D)
+                a_frame = repeat(a_frame, "b 1 d -> b t d", t=t_embedding_B_T_D.shape[1])
+                t_embedding_B_T_D = t_embedding_B_T_D + a_frame
+            else:
+                # Renderer exists for producing action frames, but encoding is external (Wan2.1 VAE).
+                # We keep this branch as a convenience hook for callers to fetch rendered frames.
+                if K is not None and E is not None:
+                    _ = self.action_renderer(action, K=K, E=E)
 
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-        # --- blocks ---
+        # -------------------- History-aware Memory --------------------
+        hist = history_latents
+        if hist is None and self.history_cfg.enabled:
+            hist = self._history_latents
+        memory_M = None
+        if hist is not None:
+            memory_M = self.framepack(hist.to(dtype=crossattn_emb.dtype, device=crossattn_emb.device))
+
+        # blocks
         if use_cuda_graphs:
             shapes_key = create_cuda_graph(
                 self.cuda_graphs,
@@ -393,21 +737,23 @@ class ProphetMinimalV1LVGDiT(MinimalV1LVGDiT):
                 crossattn_emb,
                 rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D,
-                extra_pos_emb_B_T_H_W_D,
+                extra_pos_emb,
             )
             blocks = self.cuda_graphs[shapes_key]
         else:
             blocks = self.blocks
 
-        block_kwargs = {
-            "rope_emb_L_1_1_D": rope_emb_L_1_1_D,
-            "adaln_lora_B_T_3D": adaln_lora_B_T_3D,
-            "extra_per_block_pos_emb": extra_pos_emb_B_T_H_W_D,
-        }
         for block in blocks:
-            x_B_T_H_W_D = block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
+            x_B_T_H_W_D = block(
+                x_B_T_H_W_D,
+                t_embedding_B_T_D,
+                crossattn_emb,
+                memory_M_B_S_D=memory_M,
+                rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+                adaln_lora_B_T_3D=adaln_lora_B_T_3D,
+                extra_per_block_pos_emb=extra_pos_emb,
+            )
 
-        # --- final ---
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         return self.unpatchify(x_B_T_H_W_O)
 
