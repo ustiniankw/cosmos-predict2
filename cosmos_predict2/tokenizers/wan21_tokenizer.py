@@ -48,7 +48,8 @@ class Wan21VideoTokenizer(torch.nn.Module, VideoTokenizerInterface):
     def __init__(
         self,
         *,
-        vae_pth: str,
+        vae_pth: str | None = None,
+        vae_checkpoint_path: str | None = None,
         name: str = "wan21_tokenizer",
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
@@ -64,6 +65,13 @@ class Wan21VideoTokenizer(torch.nn.Module, VideoTokenizerInterface):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        # Allow passing either `vae_pth` (legacy) or `vae_checkpoint_path` (config-driven).
+        if vae_checkpoint_path is not None:
+            if vae_pth is not None and vae_pth != vae_checkpoint_path:
+                raise ValueError("Pass only one of `vae_pth` or `vae_checkpoint_path` (or make them identical).")
+            vae_pth = vae_checkpoint_path
+        if vae_pth is None or vae_pth == "":
+            raise ValueError("Wan21VideoTokenizer requires `vae_checkpoint_path` (or `vae_pth`) to load weights.")
         self._name = name
         self._dtype = dtype
         self._device = device

@@ -1,0 +1,5 @@
+vae_checkpoint_path: "Wan2.1_VAE.pth"
+
+# Example override:
+# vae_checkpoint_path: "/absolute/path/to/Wan2.1_VAE.pth"
+
