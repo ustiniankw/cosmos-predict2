@@ -21,7 +21,7 @@ from megatron.core import parallel_state
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
 from cosmos_predict2.configs.base.config_video2world import Video2WorldPipelineConfig
-from cosmos_predict2.models.prophet_model import PhysicalActionFrameRenderer
+from cosmos_predict2.utils.action_renderer import render_action_rgb
 from cosmos_predict2.models.utils import load_state_dict
 from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
@@ -41,8 +41,6 @@ NUM_CONDITIONAL_FRAMES_KEY: str = "num_conditional_frames"
 class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype)
-        # Prophet (optional): physical action renderer for action-frame stream.
-        self.action_renderer = PhysicalActionFrameRenderer()
 
     @staticmethod
     def from_config(
@@ -227,13 +225,15 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
                     action_tensor = torch.as_tensor(action_tensor)
                 if action_tensor.ndim == 2:
                     action_tensor = action_tensor.unsqueeze(0)
-                # Render frames in [0,1], then map to [-1,1] for VAE input.
-                frames = self.action_renderer(
+                # Render frames (B,T,H,W,3) in [0,1], then map to (B,3,T,H,W) in [-1,1] for VAE input.
+                rgb = render_action_rgb(
                     action_tensor.to(device="cuda", dtype=torch.float32),
                     K.to(device="cuda", dtype=torch.float32),
                     E.to(device="cuda", dtype=torch.float32),
-                )  # (B,3,T,H,W)
-                frames = frames * 2.0 - 1.0
+                    height=256,
+                    width=256,
+                )
+                frames = rgb.permute(0, 4, 1, 2, 3).contiguous() * 2.0 - 1.0
                 # Encode to latents using the configured tokenizer.
                 data_batch["action_frame_latents"] = self.tokenizer.encode(frames.to(dtype=self.torch_dtype))
             except Exception as ex:

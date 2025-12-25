@@ -43,227 +43,10 @@ from cosmos_predict2.models.text2image_dit import Attention, GPT2FeedForward, Vi
 from cosmos_predict2.models.video2world_dit import MinimalV1LVGDiT
 from imaginaire.utils.graph import create_cuda_graph
 
-# ---------------------------------------------------------------------
-# Prophet uses Wan2.1 Video Autoencoder (Section 4.1.1)
-# (The tokenizer/autoencoder swap is wired in configs/tokenizers; here we keep
-# constants because Prophet modules assume Wan2.1 latent geometry.)
-# ---------------------------------------------------------------------
+# Prophet uses Wan2.1 Video Autoencoder geometry (Section 4.1.1).
 WAN21_LATENT_CHANNELS = 16
-WAN21_SPATIAL_DOWNSAMPLE = 8  # 8x8
-WAN21_TEMPORAL_DOWNSAMPLE = 4  # 4x
-
-
-def _euler_xyz_to_matrix(euler_xyz: torch.Tensor) -> torch.Tensor:
-    """
-    Convert XYZ euler angles to rotation matrices.
-    Args:
-        euler_xyz: (..., 3) in radians.
-    Returns:
-        R: (..., 3, 3)
-    """
-    if euler_xyz.shape[-1] != 3:
-        raise ValueError(f"Expected (...,3) euler, got {euler_xyz.shape}")
-    x, y, z = euler_xyz[..., 0], euler_xyz[..., 1], euler_xyz[..., 2]
-    cx, cy, cz = torch.cos(x), torch.cos(y), torch.cos(z)
-    sx, sy, sz = torch.sin(x), torch.sin(y), torch.sin(z)
-
-    # R = Rz * Ry * Rx
-    r00 = cz * cy
-    r01 = cz * sy * sx - sz * cx
-    r02 = cz * sy * cx + sz * sx
-    r10 = sz * cy
-    r11 = sz * sy * sx + cz * cx
-    r12 = sz * sy * cx - cz * sx
-    r20 = -sy
-    r21 = cy * sx
-    r22 = cy * cx
-    return torch.stack(
-        [
-            torch.stack([r00, r01, r02], dim=-1),
-            torch.stack([r10, r11, r12], dim=-1),
-            torch.stack([r20, r21, r22], dim=-1),
-        ],
-        dim=-2,
-    )
-
-
-def _point_line_distance_2d(
-    grid_xy_HW_2: torch.Tensor, p0_BT_2: torch.Tensor, p1_BT_2: torch.Tensor
-) -> torch.Tensor:
-    """
-    Compute per-pixel distance to 2D line segment p0->p1.
-    Args:
-        grid_xy_HW_2: (H,W,2)
-        p0_BT_2: (B,T,2)
-        p1_BT_2: (B,T,2)
-    Returns:
-        dist_B_T_H_W: (B,T,H,W)
-    """
-    # reshape to broadcast
-    g = grid_xy_HW_2[None, None, :, :, :]  # (1,1,H,W,2)
-    p0 = p0_BT_2[:, :, None, None, :]  # (B,T,1,1,2)
-    p1 = p1_BT_2[:, :, None, None, :]  # (B,T,1,1,2)
-    v = p1 - p0
-    w = g - p0
-    vv = (v * v).sum(dim=-1).clamp_min(1e-6)  # (B,T,1,1)
-    t = (w * v).sum(dim=-1) / vv  # (B,T,H,W)
-    t = t.clamp(0.0, 1.0)[..., None]  # (B,T,H,W,1)
-    proj = p0 + t * v  # (B,T,H,W,2)
-    d = g - proj
-    return torch.sqrt((d * d).sum(dim=-1) + 1e-6)
-
-
-class PhysicalActionFrameRenderer(nn.Module):
-    """
-    ProphRL ActionFrameRenderer (Section 3.2.2) — strict geometric renderer (no learnable basis).
-
-    Input:
-      - action: (B,T,7) with (dx,dy,dz, drx,dry,drz, gripper)
-      - K: (B,3,3) or (3,3)
-      - E: (B,4,4) or (4,4) where E maps world->camera
-
-    Output:
-      - frames: (B,3,T,H,W) in [0,1]
-
-    Notes:
-      The paper describes rendering around end-effector pose (p,R). In this codebase we only get
-      relative deltas; we therefore integrate deltas with a simple default initial pose:
-        p0 = (0,0,z_ref), R0 = I, and cumulative sum for translation + cumulative Euler for rotation.
-      This matches the required projection logic and is sufficient for wiring the module.
-    """
-
-    axis_length: float = 0.15
-    r_ref: float = 40.0
-    z_ref: float = 1.0
-    r_min: float = 8.0
-    r_max: float = 140.0
-
-    def __init__(self, *, height: int = 256, width: int = 256, line_width: float = 2.0) -> None:
-        super().__init__()
-        self.height = height
-        self.width = width
-        self.line_width = line_width
-
-        # Precompute pixel grid (H,W,2) in (x,y) order.
-        ys = torch.arange(height, dtype=torch.float32)
-        xs = torch.arange(width, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        grid = torch.stack([grid_x, grid_y], dim=-1)  # (H,W,2)
-        self.register_buffer("grid_xy_HW_2", grid, persistent=False)
-
-    @staticmethod
-    def _gripper_colormap(gripper_BT_1: torch.Tensor) -> torch.Tensor:
-        """
-        Fixed colormap for gripper signal.
-        Map scalar in [0,1] -> RGB.
-        """
-        g = gripper_BT_1.clamp(0.0, 1.0)
-        # 4-point gradient: blue -> cyan -> yellow -> red
-        c0 = torch.tensor([0.0, 0.2, 1.0], device=g.device, dtype=g.dtype)
-        c1 = torch.tensor([0.0, 0.9, 1.0], device=g.device, dtype=g.dtype)
-        c2 = torch.tensor([1.0, 0.9, 0.0], device=g.device, dtype=g.dtype)
-        c3 = torch.tensor([1.0, 0.1, 0.0], device=g.device, dtype=g.dtype)
-        t = g
-        # piecewise linear interpolation
-        t0 = (t * 3.0).clamp(0.0, 3.0)
-        w0 = (1.0 - (t0 - 0.0).clamp(0.0, 1.0)).unsqueeze(-1)
-        w1 = ((t0 - 0.0).clamp(0.0, 1.0)).unsqueeze(-1)
-        w2 = ((t0 - 1.0).clamp(0.0, 1.0)).unsqueeze(-1)
-        w3 = ((t0 - 2.0).clamp(0.0, 1.0)).unsqueeze(-1)
-
-        col01 = c0 * w0 + c1 * w1
-        col12 = c1 * (1.0 - w2) + c2 * w2
-        col23 = c2 * (1.0 - w3) + c3 * w3
-
-        # select segments
-        seg0 = (t0 < 1.0).to(dtype=g.dtype).unsqueeze(-1)
-        seg1 = ((t0 >= 1.0) & (t0 < 2.0)).to(dtype=g.dtype).unsqueeze(-1)
-        seg2 = (t0 >= 2.0).to(dtype=g.dtype).unsqueeze(-1)
-        return col01 * seg0 + col12 * seg1 + col23 * seg2  # (B,T,1,3)
-
-    def forward(self, action_B_T_7: torch.Tensor, K: torch.Tensor, E: torch.Tensor) -> torch.Tensor:
-        if action_B_T_7.ndim != 3 or action_B_T_7.shape[-1] != 7:
-            raise ValueError(f"Expected action (B,T,7), got {action_B_T_7.shape}")
-        device = action_B_T_7.device
-        dtype = torch.float32  # use float32 for raster math stability
-        B, T, _ = action_B_T_7.shape
-
-        # K, E broadcast to batch if unbatched
-        if K.ndim == 2:
-            K = K[None, :, :].expand(B, -1, -1)
-        if E.ndim == 2:
-            E = E[None, :, :].expand(B, -1, -1)
-        if K.shape != (B, 3, 3):
-            raise ValueError(f"Expected K shape (B,3,3), got {K.shape}")
-        if E.shape != (B, 4, 4):
-            raise ValueError(f"Expected E shape (B,4,4), got {E.shape}")
-
-        a = action_B_T_7.to(dtype=dtype)
-        dxyz = a[:, :, 0:3]
-        deuler = a[:, :, 3:6]
-        gripper = a[:, :, 6:7]
-
-        # integrate pose (simple default initial pose)
-        p0 = torch.tensor([0.0, 0.0, self.z_ref], device=device, dtype=dtype)[None, None, :]  # (1,1,3)
-        p = p0 + torch.cumsum(dxyz, dim=1)  # (B,T,3)
-        euler = torch.cumsum(deuler, dim=1)  # (B,T,3)
-        R = _euler_xyz_to_matrix(euler)  # (B,T,3,3)
-
-        # axis endpoints: p + R * (axis_length * e_k)
-        axis = torch.eye(3, device=device, dtype=dtype) * self.axis_length  # (3,3)
-        # (B,T,3,3) @ (3,3) -> (B,T,3,3) where last dim is xyz, axis index in dim=2
-        axis_vecs = torch.einsum("btij,kj->btki", R, axis)  # (B,T,3,3)
-        pk = p[:, :, None, :] + axis_vecs  # (B,T,3,3)
-
-        def project(points_B_T_N_3: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            # points -> cam space
-            ones = torch.ones((*points_B_T_N_3.shape[:-1], 1), device=device, dtype=dtype)
-            ph = torch.cat([points_B_T_N_3, ones], dim=-1)  # (B,T,N,4)
-            x_cam = torch.einsum("bij,btnj->btni", E.to(dtype=dtype), ph)  # (B,T,N,4)
-            x = x_cam[..., 0:3]  # (B,T,N,3)
-            z = x[..., 2:3].clamp_min(1e-6)
-            u_h = torch.einsum("bij,btnj->btni", K.to(dtype=dtype), x)  # (B,T,N,3)
-            u = u_h[..., 0:2] / z  # (B,T,N,2)
-            return u, z.squeeze(-1)  # u (B,T,N,2), z (B,T,N)
-
-        u_center, z_center = project(p[:, :, None, :])  # N=1
-        u_axes, _ = project(pk)  # N=3
-        u0 = u_center[:, :, 0, :]  # (B,T,2)
-        u_xyz = u_axes  # (B,T,3,2)
-
-        # radius based on depth (use center depth)
-        r = (self.r_ref * (self.z_ref / z_center)).clamp(self.r_min, self.r_max)  # (B,T)
-
-        # base colors
-        axis_colors = torch.tensor(
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.2, 1.0]], device=device, dtype=dtype
-        )  # x,y,z
-        grip_color = self._gripper_colormap(((gripper + 1.0) / 2.0).to(dtype=dtype))  # (B,T,1,3)
-
-        grid = self.grid_xy_HW_2.to(device=device, dtype=dtype)  # (H,W,2)
-        # distance to center for disk
-        dxy = grid[None, None, :, :, :] - u0[:, :, None, None, :]  # (B,T,H,W,2)
-        dist_center = torch.sqrt((dxy * dxy).sum(dim=-1) + 1e-6)  # (B,T,H,W)
-        disk = (dist_center <= r[:, :, None, None]).to(dtype=dtype)  # (B,T,H,W)
-
-        # draw axis lines: distance to segment threshold
-        # For each axis k, segment u0 -> u_xyz[:,:,k]
-        frames = torch.zeros((B, T, 3, self.height, self.width), device=device, dtype=dtype)
-
-        # disk: fill with gripper color
-        frames = frames + (disk[:, :, None, :, :] * grip_color[:, :, 0, :, None, None]).permute(0, 1, 2, 3, 4)
-
-        # axis lines
-        for k in range(3):
-            p1 = u_xyz[:, :, k, :]  # (B,T,2)
-            dist_line = _point_line_distance_2d(grid, u0, p1)  # (B,T,H,W)
-            line_mask = (dist_line <= self.line_width).to(dtype=dtype)
-            col = axis_colors[k][None, None, :, None, None]  # (1,1,3,1,1)
-            frames = torch.maximum(frames, line_mask[:, :, None, :, :] * col)
-
-        # clamp and permute to (B,3,T,H,W)
-        frames = frames.clamp(0.0, 1.0)
-        return frames.permute(0, 2, 1, 3, 4).contiguous()
+WAN21_SPATIAL_DOWNSAMPLE = 8
+WAN21_TEMPORAL_DOWNSAMPLE = 4
 
 
 class ScalarActionMLP(nn.Module):
@@ -585,7 +368,6 @@ class ProphetMinimalV1LVGDiT(MinimalV1LVGDiT):
         self.action_horizon = action_horizon
         self.scalar_action = ScalarActionMLP(action_dim=7, action_horizon=action_horizon, d_model=d_model)
         self.action_frame_latent = ActionFrameLatentEncoder(in_channels=WAN21_LATENT_CHANNELS, d_model=d_model)
-        self.action_renderer = PhysicalActionFrameRenderer()
 
         self.history_cfg = history if history is not None else ProphetHistoryBufferConfig(enabled=True)
         self._history_latents: torch.Tensor | None = None
@@ -655,13 +437,12 @@ class ProphetMinimalV1LVGDiT(MinimalV1LVGDiT):
         use_cuda_graphs: bool = False,
         *,
         # Dual Action Conditioning inputs:
-        action: torch.Tensor | None = None,  # (B, Ta, 7)
-        action_frame_latents: torch.Tensor | None = None,  # (B, 16, Ta/4, H/8, W/8) from Wan2.1 VAE
-        # Renderer inputs (to produce action frames externally; this class does not run Wan2.1 encode here):
-        K: torch.Tensor | None = None,  # (B,3,3) or (3,3)
-        E: torch.Tensor | None = None,  # (B,4,4) or (4,4)
+        # - scalar stream still uses the raw action chunk (B,Ta,7)
+        action: torch.Tensor | None = None,
+        # - action frame stream MUST receive Wan2.1 VAE-encoded action-frame latents
+        action_frame_latents: torch.Tensor | None = None,
         # History:
-        history_latents: torch.Tensor | None = None,  # (B, 16, Th, H/8, W/8)
+        history_latents: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, list[torch.Tensor]]:
         del kwargs
@@ -711,11 +492,6 @@ class ProphetMinimalV1LVGDiT(MinimalV1LVGDiT):
                 )  # (B,1,D)
                 a_frame = repeat(a_frame, "b 1 d -> b t d", t=t_embedding_B_T_D.shape[1])
                 t_embedding_B_T_D = t_embedding_B_T_D + a_frame
-            else:
-                # Renderer exists for producing action frames, but encoding is external (Wan2.1 VAE).
-                # We keep this branch as a convenience hook for callers to fetch rendered frames.
-                if K is not None and E is not None:
-                    _ = self.action_renderer(action, K=K, E=E)
 
         t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
