@@ -440,6 +440,14 @@ class GR00TV1VideoCondition(TextCondition):
 @dataclass(frozen=True)
 class ActionCondition(VideoCondition):
     action: torch.Tensor | None = None
+    # Prophet additions (ProphRL Sec 3.2):
+    # - action_frame_latents: Wan2.1 VAE latents of rendered action frames
+    # - K/E: camera intrinsics/extrinsics for rendering (optional; may be None during training)
+    # - history_latents: Wan2.1 latents of history buffer (optional; provided by closed-loop runner)
+    action_frame_latents: torch.Tensor | None = None
+    K: torch.Tensor | None = None
+    E: torch.Tensor | None = None
+    history_latents: torch.Tensor | None = None
 
 
 # ------------------- conditioner classes -------------------
@@ -645,6 +653,15 @@ class ActionConditioner(VideoConditioner):
         output = super()._forward(batch, override_dropout_rate)
         assert "action" in batch, "ActionConditioner requires 'action' in batch"
         output["action"] = batch["action"]
+        # Optional Prophet fields
+        if "action_frame_latents" in batch:
+            output["action_frame_latents"] = batch["action_frame_latents"]
+        if "K" in batch:
+            output["K"] = batch["K"]
+        if "E" in batch:
+            output["E"] = batch["E"]
+        if "history_latents" in batch:
+            output["history_latents"] = batch["history_latents"]
         return ActionCondition(**output)
 
 

@@ -21,6 +21,7 @@ from megatron.core import parallel_state
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
 from cosmos_predict2.configs.base.config_video2world import Video2WorldPipelineConfig
+from cosmos_predict2.utils.action_renderer import render_action_rgb
 from cosmos_predict2.models.utils import load_state_dict
 from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
@@ -173,6 +174,8 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         prompt: str,
         negative_prompt: str = "",
         num_latent_conditional_frames: int = 1,
+        K: torch.Tensor | None = None,
+        E: torch.Tensor | None = None,
     ):
         """
         Prepares the input data batch for the diffusion model.
@@ -209,6 +212,33 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             "action": actions,
         }
 
+        # Prophet action-frame stream support:
+        # If camera parameters are provided, render physical action frames and encode with the configured tokenizer.
+        # This produces Wan2.1 latents when the tokenizer is Wan2.1 (C_l=16, t/4, h/8, w/8).
+        if K is not None and E is not None:
+            data_batch["K"] = K
+            data_batch["E"] = E
+            try:
+                # actions expected as (B, T, 7)
+                action_tensor = actions
+                if not isinstance(action_tensor, torch.Tensor):
+                    action_tensor = torch.as_tensor(action_tensor)
+                if action_tensor.ndim == 2:
+                    action_tensor = action_tensor.unsqueeze(0)
+                # Render frames (B,T,H,W,3) in [0,1], then map to (B,3,T,H,W) in [-1,1] for VAE input.
+                rgb = render_action_rgb(
+                    action_tensor.to(device="cuda", dtype=torch.float32),
+                    K.to(device="cuda", dtype=torch.float32),
+                    E.to(device="cuda", dtype=torch.float32),
+                    height=256,
+                    width=256,
+                )
+                frames = rgb.permute(0, 4, 1, 2, 3).contiguous() * 2.0 - 1.0
+                # Encode to latents using the configured tokenizer.
+                data_batch["action_frame_latents"] = self.tokenizer.encode(frames.to(dtype=self.torch_dtype))
+            except Exception as ex:
+                log.warning(f"Failed to build action_frame_latents (skipping): {ex}")
+
         # Handle negative prompts for classifier-free guidance
         if negative_prompt:
             data_batch["neg_t5_text_embeddings"] = self.encode_prompt(negative_prompt).to(dtype=self.torch_dtype)
@@ -232,6 +262,8 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         num_sampling_step: int = 35,
         seed: int = 0,
         solver_option: str = "2ab",
+        K: torch.Tensor | None = None,
+        E: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         # Parameter check
         # width, height = VIDEO_RES_SIZE_INFO[self.config.resolution]["16:9"]  # type: ignore
@@ -252,6 +284,8 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             prompt,
             negative_prompt,
             num_latent_conditional_frames=num_latent_conditional_frames,
+            K=K,
+            E=E,
         )
 
         # preprocess

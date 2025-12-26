@@ -1,3 +1,5 @@
+# Re-export Wan2.1 tokenizer wrapper
+from .wan21_tokenizer import Wan21VideoTokenizer  # noqa: F401
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
