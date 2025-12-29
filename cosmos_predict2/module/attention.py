@@ -146,6 +146,13 @@ def attention(
             SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION]
             BEST_SDPA_BACKEND = SDPBackend.EFFICIENT_ATTENTION
 
+        # Always include the math backend as a last-resort fallback.
+        # In some environments, Flash/Efficient/CuDNN SDPA kernels can be runtime-disabled,
+        # or certain kernels may not support edge cases (e.g. seq_len==1 for CuDNN).
+        # The math backend is slower but should be universally available.
+        if SDPBackend.MATH not in SDPA_BACKENDS:
+            SDPA_BACKENDS.append(SDPBackend.MATH)
+
         if deterministic:
             raise NotImplementedError(
                 "Deterministic mode in attention is only supported when Flash Attention 3 is available."
@@ -160,6 +167,8 @@ def attention(
         except TypeError:
             sdpa_kernel_ = sdpa_kernel
             SDPA_BACKENDS = [BEST_SDPA_BACKEND]
+            if SDPBackend.MATH not in SDPA_BACKENDS:
+                SDPA_BACKENDS.append(SDPBackend.MATH)
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
