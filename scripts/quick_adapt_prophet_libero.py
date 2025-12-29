@@ -56,6 +56,7 @@ from cosmos_predict2.pipelines.video2world_action import Video2WorldActionCondit
 from cosmos_predict2.utils.action_renderer import render_action_rgb  # noqa: E402
 from cosmos_predict2.utils.libero_adapter import load_libero_hdf5_trajectory  # noqa: E402
 from imaginaire.lazy_config import LazyCall as L  # noqa: E402
+from imaginaire.auxiliary.text_encoder import CosmosTextEncoderConfig  # noqa: E402
 from imaginaire.utils import log, misc  # noqa: E402
 
 
@@ -354,10 +355,13 @@ def main() -> None:
         data_batch = {
             "dataset_name": "video_data",
             "video": video_u8,
+            # Dummy cross-attn context. Keep it minimal to reduce compute.
+            # Important: EMBED_DIM must match the DiT's expected crossattn_proj_in_channels (if projection exists),
+            # otherwise we'll hit a matmul shape error in cross-attention.
             "t5_text_embeddings": torch.zeros(
                 B,
-                256,  # CosmosTextEncoderConfig.NUM_TOKENS
-                4096,  # CosmosTextEncoderConfig.EMBED_DIM
+                1,
+                CosmosTextEncoderConfig.EMBED_DIM,
                 device=device,
                 dtype=torch.bfloat16,
             ),
