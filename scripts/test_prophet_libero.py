@@ -30,9 +30,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
+
+# Allow running as a standalone script without installing the package:
+#   python3 scripts/test_prophet_libero.py ...
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from cosmos_predict2.auxiliary.guardrail.common.io_utils import save_video
 from cosmos_predict2.pipelines.prophet_simulator import ProphetClosedLoopConfig, ProphetClosedLoopSimulator
