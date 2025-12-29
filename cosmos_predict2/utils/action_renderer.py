@@ -278,6 +278,9 @@ def render_action_rgb(
         u_center, z_center = project(p_BT3[:, :, None, :])
         u_axes, _ = project(pk_BT33)
         u0 = u_center[:, :, 0, :]  # (B,T,2)
+        # `project()` returns z with a singleton N dim for the center point; squeeze it to keep shapes consistent.
+        if z_center.ndim == 3 and z_center.shape[2] == 1:
+            z_center = z_center[:, :, 0]  # (B,T)
 
         # radius from depth
         r = (constants.r_ref * (constants.z_ref / z_center)).clamp(constants.r_min, constants.r_max)  # (B,T)
@@ -286,6 +289,9 @@ def render_action_rgb(
         dxy = grid[None, None, :, :, :] - u0[:, :, None, None, :]
         dist_center = torch.sqrt((dxy * dxy).sum(dim=-1) + 1e-6)  # (B,T,H,W)
         disk = (dist_center <= r[:, :, None, None]).to(dtype=dtype)
+        # Extra safety in case broadcasting introduced a trailing singleton dim.
+        if disk.ndim == 5 and disk.shape[-1] == 1:
+            disk = disk.squeeze(-1)
 
         grip_color = gripper_colormap(((grip_BTN1[:, :, arm, :] + 1.0) / 2.0).to(dtype=dtype))
         # Normalize grip_color shape to (B,T,3) for robust broadcasting.
@@ -294,7 +300,7 @@ def render_action_rgb(
             grip_color = grip_color.squeeze(2)
         if grip_color.ndim != 3 or grip_color.shape[-1] != 3:
             raise RuntimeError(f"Unexpected gripper colormap shape: {tuple(grip_color.shape)}")
-        disk_rgb = disk[:, :, :, :, None] * grip_color[:, :, None, None, :]
+        disk_rgb = disk.unsqueeze(-1) * grip_color[:, :, None, None, :]
 
         rgb = torch.maximum(rgb, disk_rgb)
 
