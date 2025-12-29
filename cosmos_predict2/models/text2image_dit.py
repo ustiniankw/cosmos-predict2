@@ -1397,6 +1397,10 @@ class MiniTrainDIT(WeightTrainingStat):
             padding_mask = transforms.functional.resize(
                 padding_mask, list(x_B_C_T_H_W.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
             )
+            # Ensure dtype/device match before concatenation. Otherwise, `torch.cat` may upcast
+            # the whole input to float32 (if padding_mask is float32), causing dtype mismatch
+            # with bfloat16 DiT weights in PatchEmbed.
+            padding_mask = padding_mask.to(device=x_B_C_T_H_W.device, dtype=x_B_C_T_H_W.dtype)
             x_B_C_T_H_W = torch.cat(
                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
             )
