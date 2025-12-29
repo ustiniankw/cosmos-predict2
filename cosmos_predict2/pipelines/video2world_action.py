@@ -176,6 +176,8 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         num_latent_conditional_frames: int = 1,
         K: torch.Tensor | None = None,
         E: torch.Tensor | None = None,
+        history_latents: torch.Tensor | None = None,
+        action_mode: str = "delta",
     ):
         """
         Prepares the input data batch for the diffusion model.
@@ -232,12 +234,17 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
                     E.to(device="cuda", dtype=torch.float32),
                     height=256,
                     width=256,
+                    action_mode="servo" if str(action_mode).lower() == "servo" else "delta",
                 )
                 frames = rgb.permute(0, 4, 1, 2, 3).contiguous() * 2.0 - 1.0
                 # Encode to latents using the configured tokenizer.
                 data_batch["action_frame_latents"] = self.tokenizer.encode(frames.to(dtype=self.torch_dtype))
             except Exception as ex:
                 log.warning(f"Failed to build action_frame_latents (skipping): {ex}")
+
+        # Prophet history buffer support (optional).
+        if history_latents is not None:
+            data_batch["history_latents"] = history_latents
 
         # Handle negative prompts for classifier-free guidance
         if negative_prompt:
@@ -264,6 +271,8 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         solver_option: str = "2ab",
         K: torch.Tensor | None = None,
         E: torch.Tensor | None = None,
+        history_latents: torch.Tensor | None = None,
+        action_mode: str = "delta",
     ) -> torch.Tensor | None:
         # Parameter check
         # width, height = VIDEO_RES_SIZE_INFO[self.config.resolution]["16:9"]  # type: ignore
@@ -273,8 +282,12 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
 
         # num_video_frames = self.tokenizer.get_pixel_num_frames(self.config.state_t)
 
-        # transform first frame and actions to tensor
-        vid_input = torch.from_numpy(first_frame).permute(2, 0, 1)[None, :, None, ...]
+        # Build a conditioning "video" by repeating the first frame to the tokenizer-required length.
+        # This matches Video2WorldPipeline's expectation that input video length equals
+        # tokenizer.get_pixel_num_frames(config.state_t).
+        num_video_frames = self.tokenizer.get_pixel_num_frames(self.config.state_t)
+        frame_u8 = torch.from_numpy(first_frame).to(torch.uint8).permute(2, 0, 1)  # (3,H,W)
+        vid_input = frame_u8[None, :, None, :, :].repeat(1, 1, num_video_frames, 1, 1).contiguous()
         actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)[None, ...]
 
         # Prepare the data batch with text embeddings
@@ -286,6 +299,8 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             num_latent_conditional_frames=num_latent_conditional_frames,
             K=K,
             E=E,
+            history_latents=history_latents,
+            action_mode=action_mode,
         )
 
         # preprocess

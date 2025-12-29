@@ -200,7 +200,7 @@ def render_action_rgb(
     width: int = 256,
     max_arms: int = 2,
     constants: ActionRenderConstants = ActionRenderConstants(),
-    integrate_pose: bool = True,
+    action_mode: Literal["delta", "servo"] = "delta",
 ) -> torch.Tensor:
     """
     Render action frames as RGB images on black background.
@@ -228,12 +228,16 @@ def render_action_rgb(
     if E.shape != (B, 4, 4):
         raise ValueError(f"Expected E shape (B,4,4), got {E.shape}")
 
-    # integrate pose (per arm) if requested
-    if integrate_pose:
+    # Pose source:
+    # - delta: integrate (cumsum) to get an approximate pose trajectory for visualization.
+    # - servo: actions already encode an absolute servo command (pose target); visualize directly.
+    if action_mode == "delta":
         p_BTN3, euler_BTN3 = integrate_delta_actions_to_pose(a_BTN7, z_ref=constants.z_ref)
+    elif action_mode == "servo":
+        p_BTN3 = a_BTN7[..., 0:3]
+        euler_BTN3 = a_BTN7[..., 3:6]
     else:
-        # If caller passes absolute pose in actions, they should call a different renderer.
-        p_BTN3, euler_BTN3 = integrate_delta_actions_to_pose(a_BTN7 * 0, z_ref=constants.z_ref)
+        raise ValueError(f"Unsupported action_mode: {action_mode}")
 
     R_BTN33 = euler_xyz_to_matrix(euler_BTN3)  # (B,T,N,3,3)
     grip_BTN1 = a_BTN7[..., 6:7]
