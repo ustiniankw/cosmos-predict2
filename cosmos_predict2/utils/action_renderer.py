@@ -287,8 +287,14 @@ def render_action_rgb(
         dist_center = torch.sqrt((dxy * dxy).sum(dim=-1) + 1e-6)  # (B,T,H,W)
         disk = (dist_center <= r[:, :, None, None]).to(dtype=dtype)
 
-        grip_color = gripper_colormap(((grip_BTN1[:, :, arm, :] + 1.0) / 2.0).to(dtype=dtype))  # (B,T,1,3)
-        disk_rgb = disk[:, :, :, :, None] * grip_color[:, :, 0:1, :].squeeze(2)[:, :, None, None, :]
+        grip_color = gripper_colormap(((grip_BTN1[:, :, arm, :] + 1.0) / 2.0).to(dtype=dtype))
+        # Normalize grip_color shape to (B,T,3) for robust broadcasting.
+        # Expected from gripper_colormap: (B,T,1,3), but depending on input rank it may carry extra singleton dims.
+        while grip_color.ndim > 3:
+            grip_color = grip_color.squeeze(2)
+        if grip_color.ndim != 3 or grip_color.shape[-1] != 3:
+            raise RuntimeError(f"Unexpected gripper colormap shape: {tuple(grip_color.shape)}")
+        disk_rgb = disk[:, :, :, :, None] * grip_color[:, :, None, None, :]
 
         rgb = torch.maximum(rgb, disk_rgb)
 
