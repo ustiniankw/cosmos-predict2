@@ -207,9 +207,14 @@ class Wan21VideoTokenizer(torch.nn.Module, VideoTokenizerInterface):
         if state.ndim != 5 or state.shape[1] != 3:
             raise ValueError(f"Expected state (B,3,T,H,W), got {state.shape}")
         in_dtype = state.dtype
-        scale = [self._latent_mean.to(device=state.device), self._latent_inv_std.to(device=state.device)]
+        # Ensure scale tensors are on the right device/dtype for Wan2.1 ops.
+        scale = [
+            self._latent_mean.to(device=state.device, dtype=self._dtype),
+            self._latent_inv_std.to(device=state.device, dtype=self._dtype),
+        ]
         with self._context:
-            x = state.to(self._dtype)
+            # Force dtype/device match with the VAE weights.
+            x = state.to(device=state.device, dtype=self._dtype)
             lat = self.model.encode(x, scale)
         return lat.to(in_dtype)
 
@@ -221,9 +226,13 @@ class Wan21VideoTokenizer(torch.nn.Module, VideoTokenizerInterface):
         if latent.ndim != 5 or latent.shape[1] != 16:
             raise ValueError(f"Expected latent (B,16,T,H,W), got {latent.shape}")
         in_dtype = latent.dtype
-        scale = [self._latent_mean.to(device=latent.device), self._latent_inv_std.to(device=latent.device)]
+        scale = [
+            self._latent_mean.to(device=latent.device, dtype=self._dtype),
+            self._latent_inv_std.to(device=latent.device, dtype=self._dtype),
+        ]
         with self._context:
-            z = latent.to(self._dtype)
+            # Force dtype/device match with the VAE weights (avoid conv3d dtype mismatch).
+            z = latent.to(device=latent.device, dtype=self._dtype)
             vid = self.model.decode(z, scale)
         return vid.clamp(-1.0, 1.0).to(in_dtype)
 
