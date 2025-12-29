@@ -74,11 +74,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--history_length", type=int, default=60, help="Model history buffer size (not used in this script)")
     p.add_argument("--action_mode", type=str, default="servo", choices=["servo", "delta"])
 
-    p.add_argument("--steps", type=int, default=500)
+    # Default to the "extra 1000 steps" robustness run; override as needed.
+    p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-5)
-    p.add_argument("--save_every", type=int, default=100)
+    p.add_argument("--save_every", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--cond_noise_std",
+        type=float,
+        default=0.05,
+        help="Gaussian noise std added to the first (conditional) latent frame during training.",
+    )
 
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"])
@@ -312,6 +319,9 @@ def main() -> None:
     pipe.dit.train()
     pipe.dit.x_embedder.requires_grad_(True)
     pipe.dit.final_layer.requires_grad_(True)
+    # Also unfreeze the last two DiT blocks to increase correction capacity.
+    if hasattr(pipe.dit, "blocks") and len(pipe.dit.blocks) >= 2:  # type: ignore[attr-defined]
+        pipe.dit.blocks[-2:].requires_grad_(True)  # type: ignore[attr-defined]
 
     trainable = [p for p in pipe.dit.parameters() if p.requires_grad]
     log.info(f"Trainable params: {sum(p.numel() for p in trainable):,}")
@@ -376,6 +386,25 @@ def main() -> None:
 
         # Get x0 latents and condition.
         _, x0_lat, condition = pipe.get_data_and_condition(data_batch)  # x0_lat: (B,16,T_lat,H/8,W/8)
+
+        # ------------------------------------------------------------------
+        # Noise-robustness training: corrupt the *conditional* latent frame.
+        # We keep the loss target on the clean GT latents.
+        # ------------------------------------------------------------------
+        if args.cond_noise_std > 0:
+            gt = condition.gt_frames  # type: ignore[attr-defined]
+            if gt is None:
+                raise RuntimeError("Condition is missing gt_frames; cannot apply cond noise.")
+            if gt.ndim != 5 or gt.shape[2] < 1:
+                raise RuntimeError(f"Unexpected gt_frames shape: {tuple(gt.shape)}")
+            noisy_gt = gt.clone()
+            # Add noise only to the first latent frame (conditional frame).
+            noisy_gt[:, :, 0:1, :, :] = noisy_gt[:, :, 0:1, :, :] + args.cond_noise_std * torch.randn_like(
+                noisy_gt[:, :, 0:1, :, :]
+            )
+            cond_kwargs = condition.to_dict(skip_underscore=False)
+            cond_kwargs["gt_frames"] = noisy_gt
+            condition = type(condition)(**cond_kwargs)
 
         # Diffusion-style training step (x0 prediction).
         eps = torch.randn_like(x0_lat, device=device, dtype=torch.float32)
