@@ -125,13 +125,37 @@ class FramePack(nn.Module):
         pool_stride: tuple[int, int, int] | None = None,
     ) -> None:
         super().__init__()
-        stride = pool_stride if pool_stride is not None else pool_kernel
+
+        def _as_int_tuple3(x: Any, *, name: str) -> tuple[int, int, int]:
+            # Hydra / OmegaConf may pass ListConfig here; PyTorch needs plain tuple[int,...].
+            try:
+                from omegaconf import ListConfig  # type: ignore
+            except Exception:  # pragma: no cover
+                ListConfig = ()  # type: ignore
+
+            if isinstance(x, int):
+                return (int(x), int(x), int(x))
+            if isinstance(x, (list, tuple)) or (ListConfig != () and isinstance(x, ListConfig)):
+                xs = tuple(int(v) for v in list(x))
+                if len(xs) != 3:
+                    raise ValueError(f"{name} must have length 3, got {len(xs)}: {x}")
+                return xs  # type: ignore[return-value]
+            raise TypeError(f"{name} must be int or 3-tuple/list, got {type(x)}: {x}")
+
+        pool_kernel = _as_int_tuple3(pool_kernel, name="pool_kernel")
+        stride = _as_int_tuple3(pool_stride if pool_stride is not None else pool_kernel, name="pool_stride")
         self.pool = nn.AvgPool3d(kernel_size=pool_kernel, stride=stride, ceil_mode=False)
         self.proj = nn.Linear(latent_channels, context_dim, bias=False)
 
     def forward(self, history_latents_B_C_T_H_W: torch.Tensor) -> torch.Tensor:
         if history_latents_B_C_T_H_W.ndim != 5:
             raise ValueError(f"Expected history latents (B,C,T,H,W), got {history_latents_B_C_T_H_W.shape}")
+        # Extra safety: if someone constructed AvgPool3d with a non-tuple kernel/stride (e.g. ListConfig),
+        # rebuild it once here to avoid `TypeError: avg_pool3d()` at runtime.
+        if not isinstance(self.pool.kernel_size, tuple) or not isinstance(self.pool.stride, tuple):
+            k = tuple(int(v) for v in self.pool.kernel_size)  # type: ignore[arg-type]
+            s = tuple(int(v) for v in self.pool.stride)  # type: ignore[arg-type]
+            self.pool = nn.AvgPool3d(kernel_size=k, stride=s, ceil_mode=False)
         pooled = self.pool(history_latents_B_C_T_H_W)
         tokens = rearrange(pooled, "b c t h w -> b (t h w) c").contiguous()
         return self.proj(tokens)

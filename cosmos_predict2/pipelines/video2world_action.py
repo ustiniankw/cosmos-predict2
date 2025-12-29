@@ -236,11 +236,28 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
                     width=256,
                     action_mode="servo" if str(action_mode).lower() == "servo" else "delta",
                 )
-                frames = rgb.permute(0, 4, 1, 2, 3).contiguous() * 2.0 - 1.0
+                # render_action_rgb returns (B,T,H,W,3) in [0,1]
+                if rgb.ndim != 5 or rgb.shape[-1] != 3:
+                    raise RuntimeError(f"render_action_rgb returned unexpected shape: {tuple(rgb.shape)} (expected B,T,H,W,3)")
+                # VAE expects (B,3,T,H,W) in [-1,1]
+                frames = rgb.permute(0, 4, 1, 2, 3).contiguous()
+                if frames.ndim != 5 or frames.shape[1] != 3:
+                    raise RuntimeError(
+                        f"Action frames permute produced unexpected shape: {tuple(frames.shape)} "
+                        f"from rgb={tuple(rgb.shape)} (expected B,3,T,H,W)"
+                    )
+                frames = frames * 2.0 - 1.0
                 # Encode to latents using the configured tokenizer.
                 data_batch["action_frame_latents"] = self.tokenizer.encode(frames.to(dtype=self.torch_dtype))
             except Exception as ex:
-                log.warning(f"Failed to build action_frame_latents (skipping): {ex}")
+                raise RuntimeError(
+                    "Failed to build `action_frame_latents`. Prophet requires action-frame conditioning; "
+                    "this should not be skipped.\n"
+                    f"- actions shape: {tuple(action_tensor.shape) if isinstance(action_tensor, torch.Tensor) else type(action_tensor)}\n"
+                    f"- K shape: {tuple(K.shape) if isinstance(K, torch.Tensor) else type(K)}\n"
+                    f"- E shape: {tuple(E.shape) if isinstance(E, torch.Tensor) else type(E)}\n"
+                    f"- error: {ex}"
+                ) from ex
 
         # Prophet history buffer support (optional).
         if history_latents is not None:
