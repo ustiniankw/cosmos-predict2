@@ -195,6 +195,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--action_mode", type=str, default="servo", choices=["servo", "delta"])
     p.add_argument("--d_model", type=int, default=2048, help="Prophet model_channels (Dm). Must match checkpoint.")
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument(
+        "--print_pixel_diff",
+        action="store_true",
+        help="Print per-frame mean |Δpixel| between consecutive predicted frames (debug motion/degeneracy).",
+    )
     return p.parse_args()
 
 
@@ -302,6 +307,14 @@ def main() -> None:
 
     gt_u8 = _to_u8_video(gt_all)
     pred_u8 = _to_u8_video(pred_all)
+
+    if args.print_pixel_diff:
+        # mean absolute pixel difference between consecutive predicted frames
+        diffs = np.mean(np.abs(pred_u8[1:].astype(np.int16) - pred_u8[:-1].astype(np.int16)), axis=(1, 2, 3))
+        head = diffs[:20]
+        print("=== predicted frame-to-frame pixel_difference (mean |Δ|) ===")
+        print("first 20:", ", ".join(f"{v:.3f}" for v in head))
+        print(f"min={diffs.min():.3f} max={diffs.max():.3f} mean={diffs.mean():.3f}")
 
     # Side-by-side concat: (T,H,W,3) where W doubles.
     side = np.concatenate([gt_u8, pred_u8], axis=2)

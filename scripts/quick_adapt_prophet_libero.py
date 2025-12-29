@@ -60,6 +60,53 @@ from imaginaire.auxiliary.text_encoder import CosmosTextEncoderConfig  # noqa: E
 from imaginaire.utils import log, misc  # noqa: E402
 
 
+class OnlineStandardScaler:
+    """
+    Minimal online StandardScaler (per-dim) for action normalization.
+
+    We keep it intentionally simple:
+    - update mean/var with Welford (streaming)
+    - transform uses (x-mean)/(std+eps), optional clipping
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6, clip: float = 5.0) -> None:
+        self.dim = dim
+        self.eps = eps
+        self.clip = clip
+        self.count = 0
+        self.mean = torch.zeros(dim, dtype=torch.float64)
+        self.m2 = torch.zeros(dim, dtype=torch.float64)
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        # x: (..., dim)
+        if x.numel() == 0:
+            return
+        if x.shape[-1] != self.dim:
+            raise ValueError(f"Expected last dim={self.dim}, got {tuple(x.shape)}")
+        xd = x.detach().to(dtype=torch.float64).reshape(-1, self.dim).cpu()
+        for i in range(xd.shape[0]):
+            self.count += 1
+            delta = xd[i] - self.mean
+            self.mean = self.mean + delta / self.count
+            delta2 = xd[i] - self.mean
+            self.m2 = self.m2 + delta * delta2
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != self.dim:
+            raise ValueError(f"Expected last dim={self.dim}, got {tuple(x.shape)}")
+        if self.count < 2:
+            # Not enough stats yet; return as-is.
+            return x
+        var = self.m2 / (self.count - 1)
+        std = torch.sqrt(var + self.eps).to(dtype=torch.float32, device=x.device)
+        mean = self.mean.to(dtype=torch.float32, device=x.device)
+        y = (x - mean) / std
+        if self.clip is not None and self.clip > 0:
+            y = y.clamp(-self.clip, self.clip)
+        return y
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Quick adaptation (minimal fine-tune) for Prophet on LIBERO")
     p.add_argument("--libero_dir", type=str, default="./datasets/libero_spatial", help="Directory containing LIBERO *.hdf5")
@@ -74,8 +121,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--history_length", type=int, default=60, help="Model history buffer size (not used in this script)")
     p.add_argument("--action_mode", type=str, default="servo", choices=["servo", "delta"])
 
-    # Default to the "extra 1000 steps" robustness run; override as needed.
-    p.add_argument("--steps", type=int, default=1000)
+    # Default to the "action response" run; override as needed.
+    p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--save_every", type=int, default=200)
@@ -85,6 +132,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.05,
         help="Gaussian noise std added to the first (conditional) latent frame during training.",
+    )
+    p.add_argument(
+        "--action_scale",
+        type=float,
+        default=1.0,
+        help="Extra multiplicative scale applied after action standardization (scalar action stream).",
     )
 
     p.add_argument("--device", type=str, default="cuda")
@@ -322,6 +375,10 @@ def main() -> None:
     # Also unfreeze the last two DiT blocks to increase correction capacity.
     if hasattr(pipe.dit, "blocks") and len(pipe.dit.blocks) >= 2:  # type: ignore[attr-defined]
         pipe.dit.blocks[-2:].requires_grad_(True)  # type: ignore[attr-defined]
+    # Unfreeze *all* cross-attention parameters (action/history signals need capacity here).
+    for name, param in pipe.dit.named_parameters():
+        if ".cross_attn." in name or name.startswith("crossattn_proj."):
+            param.requires_grad_(True)
 
     trainable = [p for p in pipe.dit.parameters() if p.requires_grad]
     log.info(f"Trainable params: {sum(p.numel() for p in trainable):,}")
@@ -335,6 +392,8 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    action_scaler = OnlineStandardScaler(dim=7)
+
     for step in range(1, args.steps + 1):
         video_u8, action_f32, K, E, padding_mask = _sample_batch(
             hdf5_paths=hdf5_paths,
@@ -347,6 +406,10 @@ def main() -> None:
         B, _, T_pix, H, W = video_u8.shape
         assert T_pix == args.action_horizon + 1
 
+        # Update action scaler and transform the scalar action stream.
+        action_scaler.update(action_f32)
+        action_for_model = action_scaler.transform(action_f32) * float(args.action_scale)
+
         # Build action_frame_latents (Wan2.1 latents of rendered action frames).
         # render_action_rgb expects actions (B,Ta,7) float32 and K/E tensors.
         action_rgb = render_action_rgb(
@@ -357,9 +420,13 @@ def main() -> None:
             width=W,
             action_mode=args.action_mode,
         )  # (B,Ta,H,W,3) in [0,1]
+        if float(action_rgb.abs().mean().item()) < 1e-6:
+            raise RuntimeError("Rendered action frames are near-zero; check action scaling/mode/K/E.")
         action_frames = action_rgb.permute(0, 4, 1, 2, 3).contiguous() * 2.0 - 1.0  # (B,3,Ta,H,W) in [-1,1]
         with torch.no_grad():
             action_frame_latents = pipe.tokenizer.encode(action_frames.to(dtype=torch_dtype))
+        if float(action_frame_latents.abs().mean().item()) < 1e-6:
+            raise RuntimeError("action_frame_latents are near-zero; action conditioning may be broken.")
 
         # Build data_batch compatible with ActionConditioner + Video2WorldPipeline.get_data_and_condition().
         data_batch = {
@@ -378,7 +445,7 @@ def main() -> None:
             "fps": torch.ones((B,), device=device, dtype=torch.int32) * 10,
             "padding_mask": padding_mask,
             "num_conditional_frames": 1,
-            "action": action_f32.to(dtype=torch_dtype),
+            "action": action_for_model.to(dtype=torch_dtype),
             "action_frame_latents": action_frame_latents,
             "K": K,
             "E": E,
