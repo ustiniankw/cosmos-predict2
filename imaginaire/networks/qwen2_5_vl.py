@@ -64,7 +64,8 @@ else:
     print("flash_attn_2 not available")
     flash_attn_varlen_func = None
 
-assert is_flash_attn_2_available(), "flash_attn_2 not available. run pip install flash_attn"
+# assert is_flash_attn_2_available(), "flash_attn_2 not available. run pip install flash_attn"
+# NOTE: Flash attention not required for Prophet training (only needed for Qwen VLM inference)
 
 logger = logging.get_logger(__name__)
 

@@ -200,3 +200,4 @@ cython_debug/
 /examples/**/checkpoints
 /examples/**/output
 /examples/**/datasets
+pretrained_models/

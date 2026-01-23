@@ -263,8 +263,10 @@ def main() -> None:
     history_latents = closed_loop.init(x0.unsqueeze(0).to(device=device))  # (B,16,T_h,*,*)
 
     # Closed-loop rollout.
-    K = torch.from_numpy(traj.K).to(device=device, dtype=torch.float32)
-    E = torch.from_numpy(traj.E).to(device=device, dtype=torch.float32)
+    # NOTE: LIBERO data has identity K/E matrices, so we DISABLE action_frame_latents
+    # by NOT passing K/E. This matches the training configuration (ProphRL paper).
+    # K = torch.from_numpy(traj.K).to(device=device, dtype=torch.float32)
+    # E = torch.from_numpy(traj.E).to(device=device, dtype=torch.float32)
 
     first_frame = x0_u8
     generated_chunks: list[torch.Tensor] = []
@@ -279,8 +281,8 @@ def main() -> None:
             guidance=args.guidance,
             num_sampling_step=args.steps,
             seed=args.seed + k,
-            K=K,
-            E=E,
+            K=None,  # DISABLED: LIBERO has invalid camera params
+            E=None,  # DISABLED: LIBERO has invalid camera params
             history_latents=history_latents,
             action_mode=args.action_mode,
         )
